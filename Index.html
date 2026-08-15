@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Sky Sensor Test</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: #05060a;
+    color: #e8ecf1;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    height: 100%;
+    overflow: hidden;
+  }
+  #canvas-wrap {
+    position: fixed;
+    inset: 0;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  #hud {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    padding: 14px 16px;
+    background: linear-gradient(180deg, rgba(5,6,10,0.9), rgba(5,6,10,0));
+    font-size: 13px;
+    line-height: 1.5;
+    z-index: 10;
+    pointer-events: none;
+  }
+  #hud .row {
+    display: flex;
+    justify-content: space-between;
+    color: #9aa4b2;
+  }
+  #hud .row b {
+    color: #e8ecf1;
+    font-variant-numeric: tabular-nums;
+  }
+  #status {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    padding: 16px;
+    background: linear-gradient(0deg, rgba(5,6,10,0.95), rgba(5,6,10,0));
+    z-index: 10;
+  }
+  #msg {
+    font-size: 14px;
+    color: #9aa4b2;
+    margin-bottom: 10px;
+    min-height: 40px;
+  }
+  #msg.found {
+    color: #ffd27a;
+  }
+  button {
+    width: 100%;
+    padding: 14px;
+    border-radius: 10px;
+    border: none;
+    background: #3a5cff;
+    color: white;
+    font-size: 15px;
+    font-weight: 600;
+    -webkit-tap-highlight-color: transparent;
+  }
+  button:active {
+    background: #2c47d1;
+  }
+  #err {
+    position: fixed;
+    inset: 0;
+    background: #05060a;
+    z-index: 20;
+    display: none;
+    padding: 24px;
+    font-size: 15px;
+    line-height: 1.6;
+  }
+  #err.show { display: block; }
+  #err h2 { color: #ff8080; margin-top: 0; }
+  #err code {
+    background: #14161c;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+
+<div id="canvas-wrap">
+  <canvas id="sky"></canvas>
+</div>
+
+<div id="hud">
+  <div class="row"><span>Heading</span><b id="hud-heading">--°</b></div>
+  <div class="row"><span>Tilt (altitude)</span><b id="hud-tilt">--°</b></div>
+  <div class="row"><span>Lat / Long</span><b id="hud-latlong">--</b></div>
+</div>
+
+<div id="status">
+  <div id="msg">Tap start, then point your phone at the sky.</div>
+  <button id="start-btn">Start sensors</button>
+</div>
+
+<div id="err">
+  <h2>Couldn't start</h2>
+  <p id="err-text"></p>
+  <p>This test needs to run over <code>https://</code> (or <code>localhost</code>) for the compass and GPS to be available — plain <code>http://</code> on a local IP won't work on most phones.</p>
+</div>
+
+<script>
+/*
+  SKY SENSOR TEST — confirmed-working base + multi-constellation
+  ----------------------------------------------------------------
+  Base sensor/smoothing/rendering logic is UNCHANGED from the
+  confirmed-working version. Added on top:
+  - Orion's Belt now renders all 3 stars connected (was already 3
+    stars in this base, just confirming it stays that way)
+  - A second constellation (Southern Cross) roughly opposite Orion
+  - Horizon check: only draws a constellation if all its stars are
+    above the horizon, so no partial/broken shapes render
+
+  Still NO camera feed — blank canvas so the sensor + astronomy math
+  can be verified on its own before adding AR video.
+*/
+
+const canvas = document.getElementById('sky');
+const ctx = canvas.getContext('2d');
+function resize() {
+  canvas.width = window.innerWidth * window.devicePixelRatio;
+  canvas.height = window.innerHeight * window.devicePixelRatio;
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Assumed camera field of view (degrees) — phone cameras are
+// typically ~60-70° horizontal. We'll refine this later against
+// the real camera feed; for now it just sets how "zoomed in" the
+// blank-canvas test feels.
+const FOV_H = 65;
+const FOV_V = 65 * (window.innerHeight / window.innerWidth);
+
+// --- Constellations ---
+// RA/Dec in degrees (J2000 epoch — fixed, doesn't change with time).
+// `links` defines which stars connect to which, by index into `stars`.
+const CONSTELLATIONS = [
+  {
+    name: 'Orion\'s Belt',
+    color: '#ffd27a',
+    stars: [
+      { name: 'Mintaka',  ra: 83.00,  dec: -0.30 },
+      { name: 'Alnilam',  ra: 84.05,  dec: -1.20 },
+      { name: 'Alnitak',  ra: 85.19,  dec: -1.94 },
+    ],
+    links: [[0, 1], [1, 2]],
+  },
+  {
+    name: 'Southern Cross (Crux)',
+    color: '#8ad4ff',
+    // RA ~12.5h, roughly opposite Orion (~5.5h) in right ascension.
+    stars: [
+      { name: 'Acrux',   ra: 186.65, dec: -63.10 },
+      { name: 'Gacrux',  ra: 187.79, dec: -57.11 },
+      { name: 'Imai',    ra: 191.93, dec: -59.69 },
+      { name: 'Mimosa',  ra: 191.44, dec: -59.69 },
+    ],
+    links: [[0, 1], [2, 3]],
+  },
+];
+
+let state = {
+  heading: null,   // compass azimuth, degrees, 0 = North (smoothed)
+  tiltAlt: null,   // device tilt converted to altitude, degrees above horizon (smoothed)
+  lat: null,
+  lon: null,
+};
+
+// Smoothing factor: lower = smoother but laggier, higher = snappier but jumpier.
+const SMOOTHING = 0.15;
+
+// Smooths an angle that wraps at 0/360 (compass heading) without
+// glitching at the wrap point — e.g. going from 359° to 1° should
+// smooth through 360°, not snap backward through 180°.
+function smoothAngle(current, target, factor) {
+  if (current === null) return target;
+  let diff = angDiff(target, current); // shortest signed distance, handles wrap
+  return ((current + diff * factor) % 360 + 360) % 360;
+}
+
+function smoothLinear(current, target, factor) {
+  if (current === null) return target;
+  return current + (target - current) * factor;
+}
+
+function toRad(d) { return d * Math.PI / 180; }
+function toDeg(r) { return r * 180 / Math.PI; }
+
+// Julian Date from a JS Date, needed for sidereal time
+function julianDate(date) {
+  return (date.getTime() / 86400000) + 2440587.5;
+}
+
+// Greenwich Mean Sidereal Time, in degrees
+function gmst(date) {
+  const jd = julianDate(date);
+  const T = (jd - 2451545.0) / 36525.0;
+  let gmstDeg = 280.46061837
+    + 360.98564736629 * (jd - 2451545.0)
+    + 0.000387933 * T * T
+    - (T * T * T) / 38710000.0;
+  gmstDeg = ((gmstDeg % 360) + 360) % 360;
+  return gmstDeg;
+}
+
+// Local Sidereal Time, in degrees
+function lst(date, lonDeg) {
+  return ((gmst(date) + lonDeg) % 360 + 360) % 360;
+}
+
+// Convert RA/Dec + observer lat/long/time -> Altitude/Azimuth
+function equatorialToHorizontal(raDeg, decDeg, latDeg, lonDeg, date) {
+  const localSiderealDeg = lst(date, lonDeg);
+  let haDeg = localSiderealDeg - raDeg;
+  haDeg = ((haDeg % 360) + 360) % 360;
+
+  const ha = toRad(haDeg);
+  const dec = toRad(decDeg);
+  const lat = toRad(latDeg);
+
+  const sinAlt = Math.sin(dec) * Math.sin(lat) + Math.cos(dec) * Math.cos(lat) * Math.cos(ha);
+  const alt = Math.asin(sinAlt);
+
+  const cosAz = (Math.sin(dec) - Math.sin(alt) * Math.sin(lat)) / (Math.cos(alt) * Math.cos(lat));
+  let az = Math.acos(Math.min(1, Math.max(-1, cosAz)));
+  az = toDeg(az);
+
+  // acos gives 0-180, need to determine which half of the circle
+  if (Math.sin(ha) > 0) {
+    az = 360 - az;
+  }
+
+  return { alt: toDeg(alt), az: az };
+}
+
+// Shortest signed angular difference, handling the 0/360 wraparound
+function angDiff(a, b) {
+  let d = ((a - b + 540) % 360) - 180;
+  return d;
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const w = window.innerWidth, h = window.innerHeight;
+
+  // faint horizon reference grid, purely visual
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    ctx.beginPath();
+    ctx.moveTo(0, (h / 4) * i);
+    ctx.lineTo(w, (h / 4) * i);
+    ctx.stroke();
+  }
+
+  const msgEl = document.getElementById('msg');
+
+  if (state.heading === null || state.lat === null) {
+    return;
+  }
+
+  const now = new Date();
+  const visibleNames = [];
+
+  CONSTELLATIONS.forEach(constellation => {
+    // Compute alt/az for every star in this constellation first.
+    const computed = constellation.stars.map(star =>
+      equatorialToHorizontal(star.ra, star.dec, state.lat, state.lon, now)
+    );
+
+    // Only consider this constellation "above the horizon" if ALL
+    // its stars are — a partially-risen constellation would look
+    // broken/cut-off, so we treat it as not-yet-visible.
+    const allAboveHorizon = computed.every(pos => pos.alt >= 0);
+    if (!allAboveHorizon) return;
+
+    // Project each star to screen space; skip stars outside the FOV.
+    const screenPts = computed.map((pos, i) => {
+      const dAz = angDiff(pos.az, state.heading);
+      const dAlt = pos.alt - state.tiltAlt;
+      const inView = Math.abs(dAz) <= FOV_H / 2 && Math.abs(dAlt) <= FOV_V / 2;
+      return {
+        x: w / 2 + (dAz / (FOV_H / 2)) * (w / 2),
+        y: h / 2 - (dAlt / (FOV_V / 2)) * (h / 2),
+        inView,
+        name: constellation.stars[i].name,
+      };
+    });
+
+    // If none of this constellation's stars are currently in the
+    // camera's FOV, nothing to draw for it right now (even though
+    // it IS above the horizon somewhere in the sky).
+    if (!screenPts.some(p => p.inView)) return;
+
+    visibleNames.push(constellation.name);
+
+    // Draw connecting lines first (so stars sit on top)
+    ctx.strokeStyle = constellation.color + '80'; // ~50% alpha
+    ctx.lineWidth = 1.5;
+    constellation.links.forEach(([a, b]) => {
+      const pa = screenPts[a], pb = screenPts[b];
+      // draw the link if at least one endpoint is in view, so lines
+      // don't vanish the instant one star drifts just off-screen
+      if (pa.inView || pb.inView) {
+        ctx.beginPath();
+        ctx.moveTo(pa.x, pa.y);
+        ctx.lineTo(pb.x, pb.y);
+        ctx.stroke();
+      }
+    });
+
+    // Draw each star that's actually in view
+    screenPts.forEach(p => {
+      if (!p.inView) return;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = constellation.color;
+      ctx.shadowColor = constellation.color;
+      ctx.shadowBlur = 12;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      ctx.font = '12px -apple-system, sans-serif';
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText(p.name, p.x + 10, p.y + 4);
+    });
+  });
+
+  if (visibleNames.length > 0) {
+    msgEl.textContent = visibleNames.join(' and ') + ' in view — pan away and it should disappear.';
+    msgEl.classList.add('found');
+  } else {
+    msgEl.textContent = 'Not in view right now. Slowly pan around the sky.';
+    msgEl.classList.remove('found');
+  }
+}
+
+function updateHud() {
+  document.getElementById('hud-heading').textContent =
+    state.heading !== null ? state.heading.toFixed(1) + '°' : '--°';
+  document.getElementById('hud-tilt').textContent =
+    state.tiltAlt !== null ? state.tiltAlt.toFixed(1) + '°' : '--°';
+  document.getElementById('hud-latlong').textContent =
+    state.lat !== null ? state.lat.toFixed(3) + ', ' + state.lon.toFixed(3) : '--';
+}
+
+function loop() {
+  updateHud();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function handleOrientation(event) {
+  // iOS gives a direct compass heading; Android needs alpha + absolute check.
+  let heading;
+  if (typeof event.webkitCompassHeading === 'number') {
+    heading = event.webkitCompassHeading; // iOS: already 0=North, clockwise
+  } else if (event.alpha !== null) {
+    heading = 360 - event.alpha; // Android approximation, often needs calibration
+  } else {
+    return;
+  }
+
+  const rawHeading = ((heading % 360) + 360) % 360;
+  state.heading = smoothAngle(state.heading, rawHeading, SMOOTHING);
+
+  // beta: front-back tilt, -180 to 180, 0 = flat, 90 = upright pointing at horizon
+  // Convert "phone held upright, pointed at sky" tilt into altitude degrees.
+  if (event.beta !== null) {
+    // when beta ~90 (phone vertical, screen facing you), treat as pointing at horizon (alt 0)
+    // tilting top of phone further back/up increases altitude
+    const rawTiltAlt = event.beta - 90;
+    state.tiltAlt = smoothLinear(state.tiltAlt, rawTiltAlt, SMOOTHING);
+  }
+}
+
+function handleError(text) {
+  document.getElementById('err-text').textContent = text;
+  document.getElementById('err').classList.add('show');
+}
+
+document.getElementById('start-btn').addEventListener('click', async () => {
+  // Geolocation
+  if (!navigator.geolocation) {
+    handleError('Geolocation is not available in this browser.');
+    return;
+  }
+  navigator.geolocation.watchPosition(
+    pos => {
+      state.lat = pos.coords.latitude;
+      state.lon = pos.coords.longitude;
+      document.getElementById('hud-latlong').style.color = '';
+    },
+    err => {
+      document.getElementById('hud-latlong').textContent = 'FAILED: ' + err.message;
+      document.getElementById('hud-latlong').style.color = '#ff8080';
+    },
+    { enableHighAccuracy: true, timeout: 10000 }
+  );
+
+  // DeviceOrientation — iOS 13+ requires an explicit permission prompt
+  if (typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof DeviceOrientationEvent.requestPermission === 'function') {
+    try {
+      const perm = await DeviceOrientationEvent.requestPermission();
+      if (perm !== 'granted') {
+        handleError('Motion & orientation permission was not granted.');
+        return;
+      }
+    } catch (e) {
+      handleError('Could not request orientation permission: ' + e.message);
+      return;
+    }
+  }
+
+  window.addEventListener('deviceorientation', handleOrientation, true);
+  document.getElementById('start-btn').textContent = 'Sensors running';
+  document.getElementById('start-btn').disabled = true;
+
+  loop();
+});
+</script>
+
+</body>
+</html>
