@@ -101,6 +101,7 @@
 <div id="hud">
   <div class="row"><span>Heading</span><b id="hud-heading">--°</b></div>
   <div class="row"><span>Tilt (altitude)</span><b id="hud-tilt">--°</b></div>
+  <div class="row"><span>Roll</span><b id="hud-roll">--°</b></div>
   <div class="row"><span>Lat / Long</span><b id="hud-latlong">--</b></div>
   <div class="row"><span>Debug</span><b id="hud-debug" style="font-size:11px">--</b></div>
 </div>
@@ -118,15 +119,22 @@
 
 <script>
 /*
-  SKY SENSOR TEST — confirmed-working base + multi-constellation
+  SKY SENSOR TEST — real 3D perspective projection
   ----------------------------------------------------------------
-  Base sensor/smoothing/rendering logic is UNCHANGED from the
-  confirmed-working version. Added on top:
-  - Orion's Belt now renders all 3 stars connected (was already 3
-    stars in this base, just confirming it stays that way)
-  - A second constellation (Southern Cross) roughly opposite Orion
-  - Horizon check: only draws a constellation if all its stars are
-    above the horizon, so no partial/broken shapes render
+  Previous version mapped stars to screen space by just subtracting
+  azimuth/altitude and scaling linearly — a flat approximation that
+  distorted badly near the zenith and ignored phone roll entirely.
+
+  This version projects properly:
+  1. altAzToWorldVector — star alt/az -> 3D unit vector (East-North-Up)
+  2. worldToCameraSpace — rotate that vector by heading (yaw), tilt
+     (pitch), AND roll (twist), using real 3D rotation, not angle
+     subtraction
+  3. projectToScreen — pinhole-camera perspective projection (tan-based
+     focal length), the same math real cameras/game engines use
+
+  Constellation RA/Dec data is unchanged — only the projection path
+  from "computed alt/az" to "screen pixel" was rebuilt.
 
   Still NO camera feed — blank canvas so the sensor + astronomy math
   can be verified on its own before adding AR video.
@@ -188,6 +196,7 @@ const CONSTELLATIONS = [
 let state = {
   heading: null,   // compass azimuth, degrees, 0 = North (smoothed)
   tiltAlt: null,   // device tilt converted to altitude, degrees above horizon (smoothed)
+  roll: 0,         // device roll/twist around its own pointing axis, degrees (smoothed)
   lat: null,
   lon: null,
 };
@@ -265,6 +274,83 @@ function angDiff(a, b) {
   return d;
 }
 
+// --- 3D perspective projection ---
+// This replaces the old "just subtract angles and scale linearly"
+// approach. That flat method treated every degree of azimuth as the
+// same number of pixels everywhere on screen, which is wrong — the
+// sky is a sphere, not a flat grid, so objects near the zenith swing
+// sideways much faster (in screen terms) for the same azimuth change
+// than objects near the horizon do. It also had no way to represent
+// the phone being twisted/rolled. This section fixes both.
+
+// Convert a star's altitude/azimuth into a 3D unit vector in an
+// East-North-Up (ENU) "world" coordinate frame. This is just standard
+// spherical-to-Cartesian conversion — altitude/azimuth describe a
+// point on the sky-sphere the same way latitude/longitude describe a
+// point on Earth's surface.
+function altAzToWorldVector(altDeg, azDeg) {
+  const alt = toRad(altDeg), az = toRad(azDeg);
+  return {
+    e: Math.cos(alt) * Math.sin(az), // East component
+    n: Math.cos(alt) * Math.cos(az), // North component
+    u: Math.sin(alt),                // Up component
+  };
+}
+
+// Rotate a world-frame star vector into camera-relative space using
+// the phone's current heading (yaw), tilt (pitch), and roll — applied
+// as three sequential axis rotations, which together form a full 3D
+// rotation matrix. This is the core fix: instead of subtracting
+// angles, we actually rotate the star's 3D position to match where
+// the camera is currently pointing, the same way a flight simulator
+// or game camera works.
+function worldToCameraSpace(v, headingDeg, tiltDeg, rollDeg) {
+  const h = toRad(headingDeg);
+  const t = toRad(tiltDeg);
+  const r = toRad(rollDeg);
+
+  // 1) YAW: rotate around the Up axis by heading, so the camera's
+  //    level pointing direction becomes the new "forward" axis.
+  const R0 = v.e * Math.cos(h) - v.n * Math.sin(h); // right-ish axis
+  const F0 = v.e * Math.sin(h) + v.n * Math.cos(h); // forward-ish axis
+  const U0 = v.u;
+
+  // 2) PITCH: rotate around the (now-aligned) right axis by tilt, so
+  //    the camera's actual up/down aim becomes the new "forward" axis.
+  const F1 = F0 * Math.cos(t) + U0 * Math.sin(t);
+  const U1 = -F0 * Math.sin(t) + U0 * Math.cos(t);
+  const R1 = R0;
+
+  // 3) ROLL: rotate around the forward axis by roll, accounting for
+  //    the phone being twisted along the direction it's pointing.
+  const R2 = R1 * Math.cos(r) - U1 * Math.sin(r);
+  const U2 = R1 * Math.sin(r) + U1 * Math.cos(r);
+  const F2 = F1;
+
+  return { right: R2, up: U2, forward: F2 };
+}
+
+// Standard pinhole-camera perspective projection: given a point in
+// camera space and the canvas size, work out where it lands on
+// screen. Using tan()-based focal length (rather than a linear
+// degree-to-pixel scale) is what correctly reproduces real camera/eye
+// perspective — objects near the edge of the FOV appear to move
+// faster on screen than objects near the center, just like reality.
+function projectToScreen(camVec, canvasW, canvasH, fovHDeg, fovVDeg) {
+  if (camVec.forward <= 0) {
+    // Point is behind the camera — nothing to draw.
+    return { inView: false };
+  }
+  const focalX = (canvasW / 2) / Math.tan(toRad(fovHDeg) / 2);
+  const focalY = (canvasH / 2) / Math.tan(toRad(fovVDeg) / 2);
+
+  const screenX = canvasW / 2 + (camVec.right / camVec.forward) * focalX;
+  const screenY = canvasH / 2 - (camVec.up / camVec.forward) * focalY;
+
+  const inView = screenX >= 0 && screenX <= canvasW && screenY >= 0 && screenY <= canvasH;
+  return { x: screenX, y: screenY, inView };
+}
+
 function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const w = window.innerWidth, h = window.innerHeight;
@@ -304,15 +390,17 @@ function draw() {
     const allAboveHorizon = computed.every(pos => pos.alt >= 0);
     if (!allAboveHorizon) return;
 
-    // Project each star to screen space; skip stars outside the FOV.
+    // Project each star to screen space using the real 3D pipeline:
+    // alt/az -> world vector -> rotate into camera space (yaw, pitch,
+    // roll) -> perspective-project onto the screen.
     const screenPts = computed.map((pos, i) => {
-      const dAz = angDiff(pos.az, state.heading);
-      const dAlt = pos.alt - state.tiltAlt;
-      const inView = Math.abs(dAz) <= FOV_H / 2 && Math.abs(dAlt) <= FOV_V / 2;
+      const worldVec = altAzToWorldVector(pos.alt, pos.az);
+      const camVec = worldToCameraSpace(worldVec, state.heading, state.tiltAlt, state.roll);
+      const proj = projectToScreen(camVec, w, h, FOV_H, FOV_V);
       return {
-        x: w / 2 + (dAz / (FOV_H / 2)) * (w / 2),
-        y: h / 2 - (dAlt / (FOV_V / 2)) * (h / 2),
-        inView,
+        x: proj.x,
+        y: proj.y,
+        inView: proj.inView,
         name: constellation.stars[i].name,
       };
     });
@@ -372,6 +460,7 @@ function updateHud() {
     state.heading !== null ? state.heading.toFixed(1) + '°' : '--°';
   document.getElementById('hud-tilt').textContent =
     state.tiltAlt !== null ? state.tiltAlt.toFixed(1) + '°' : '--°';
+  document.getElementById('hud-roll').textContent = state.roll.toFixed(1) + '°';
   document.getElementById('hud-latlong').textContent =
     state.lat !== null ? state.lat.toFixed(3) + ', ' + state.lon.toFixed(3) : '--';
 }
@@ -403,6 +492,17 @@ function handleOrientation(event) {
     // tilting top of phone further back/up increases altitude
     const rawTiltAlt = event.beta - 90;
     state.tiltAlt = smoothLinear(state.tiltAlt, rawTiltAlt, SMOOTHING);
+  }
+
+  // gamma: left-right tilt, -90 to 90. When the phone is held roughly
+  // upright and pointed outward (the way this app expects to be used),
+  // gamma approximates how much the phone is twisted/rolled around its
+  // own pointing axis — e.g. tipping the top edge left or right while
+  // still aiming at the same spot in the sky. This is an approximation
+  // that assumes portrait orientation; it isn't a fully general roll
+  // solution for every possible way of holding the phone.
+  if (event.gamma !== null) {
+    state.roll = smoothLinear(state.roll, event.gamma, SMOOTHING);
   }
 }
 
