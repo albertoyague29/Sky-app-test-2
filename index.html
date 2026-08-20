@@ -102,6 +102,7 @@
   <div class="row"><span>Heading</span><b id="hud-heading">--°</b></div>
   <div class="row"><span>Tilt (altitude)</span><b id="hud-tilt">--°</b></div>
   <div class="row"><span>Lat / Long</span><b id="hud-latlong">--</b></div>
+  <div class="row"><span>Debug</span><b id="hud-debug" style="font-size:11px">--</b></div>
 </div>
 
 <div id="status">
@@ -165,16 +166,22 @@ const CONSTELLATIONS = [
     links: [[0, 1], [1, 2]],
   },
   {
-    name: 'Southern Cross (Crux)',
+    name: 'Big Dipper (Ursa Major)',
     color: '#8ad4ff',
-    // RA ~12.5h, roughly opposite Orion (~5.5h) in right ascension.
+    // Circumpolar from UK latitudes (~50°N+) — never sets below the
+    // horizon, so this should be findable any time, any season,
+    // unlike Crux which never rises there at all.
     stars: [
-      { name: 'Acrux',   ra: 186.65, dec: -63.10 },
-      { name: 'Gacrux',  ra: 187.79, dec: -57.11 },
-      { name: 'Imai',    ra: 191.93, dec: -59.69 },
-      { name: 'Mimosa',  ra: 191.44, dec: -59.69 },
+      { name: 'Dubhe',   ra: 165.93, dec: 61.75 },
+      { name: 'Merak',   ra: 165.46, dec: 56.38 },
+      { name: 'Phecda',  ra: 178.46, dec: 53.69 },
+      { name: 'Megrez',  ra: 183.86, dec: 57.03 },
+      { name: 'Alioth',  ra: 193.51, dec: 55.96 },
+      { name: 'Mizar',   ra: 200.98, dec: 54.93 },
+      { name: 'Alkaid',  ra: 206.89, dec: 49.31 },
     ],
-    links: [[0, 1], [2, 3]],
+    // Bowl: Dubhe-Merak-Phecda-Megrez-Dubhe, handle: Megrez-Alioth-Mizar-Alkaid
+    links: [[0, 1], [1, 2], [2, 3], [3, 0], [3, 4], [4, 5], [5, 6]],
   },
 ];
 
@@ -280,12 +287,16 @@ function draw() {
 
   const now = new Date();
   const visibleNames = [];
+  const debugLines = [];
 
   CONSTELLATIONS.forEach(constellation => {
     // Compute alt/az for every star in this constellation first.
     const computed = constellation.stars.map(star =>
       equatorialToHorizontal(star.ra, star.dec, state.lat, state.lon, now)
     );
+
+    const alts = computed.map(p => p.alt);
+    debugLines.push(constellation.name + ': alt ' + Math.min(...alts).toFixed(0) + '° to ' + Math.max(...alts).toFixed(0) + '°');
 
     // Only consider this constellation "above the horizon" if ALL
     // its stars are — a partially-risen constellation would look
@@ -352,6 +363,8 @@ function draw() {
     msgEl.textContent = 'Not in view right now. Slowly pan around the sky.';
     msgEl.classList.remove('found');
   }
+
+  document.getElementById('hud-debug').textContent = debugLines.join(' | ');
 }
 
 function updateHud() {
