@@ -104,6 +104,7 @@
   <div class="row"><span>Roll</span><b id="hud-roll">--°</b></div>
   <div class="row"><span>Lat / Long</span><b id="hud-latlong">--</b></div>
   <div class="row"><span>Debug</span><b id="hud-debug" style="font-size:11px">--</b></div>
+  <div class="row"><b id="hud-gimbal" style="color:#ffb347"></b></div>
 </div>
 
 <div id="status">
@@ -214,19 +215,37 @@ const MAX_STEP_PER_FRAME = 6; // degrees
 // Smooths an angle that wraps at 0/360 (compass heading) without
 // glitching at the wrap point — e.g. going from 359° to 1° should
 // smooth through 360°, not snap backward through 180°.
-function smoothAngle(current, target, factor) {
+function smoothAngle(current, target, factor, damping) {
   if (current === null) return target;
+  damping = damping === undefined ? 1 : damping;
   let diff = angDiff(target, current); // shortest signed distance, handles wrap
-  let step = diff * factor;
-  step = Math.max(-MAX_STEP_PER_FRAME, Math.min(MAX_STEP_PER_FRAME, step));
+  let step = diff * factor * damping;
+  const maxStep = MAX_STEP_PER_FRAME * damping;
+  step = Math.max(-maxStep, Math.min(maxStep, step));
   return ((current + step) % 360 + 360) % 360;
 }
 
-function smoothLinear(current, target, factor) {
+function smoothLinear(current, target, factor, damping) {
   if (current === null) return target;
-  let step = (target - current) * factor;
-  step = Math.max(-MAX_STEP_PER_FRAME, Math.min(MAX_STEP_PER_FRAME, step));
+  damping = damping === undefined ? 1 : damping;
+  let step = (target - current) * factor * damping;
+  const maxStep = MAX_STEP_PER_FRAME * damping;
+  step = Math.max(-maxStep, Math.min(maxStep, step));
   return current + step;
+}
+
+// The phone's raw orientation sensors (alpha/beta/gamma) suffer from
+// "gimbal lock": when tilt is near 0° (pointing near the horizon,
+// beta near 90°), heading and roll become mathematically coupled and
+// tiny real movements get misread as huge swings in either value.
+// This isn't a bug we introduced — it's inherent to how these Euler
+// angles work. The fix: fade responsiveness toward 0 as tilt
+// approaches the unstable zone, so noise gets suppressed exactly
+// where the sensor is least trustworthy, without affecting normal use.
+const GIMBAL_ZONE_DEG = 20; // within this many degrees of tilt=0, damping kicks in
+function gimbalDamping(tiltDeg) {
+  const t = Math.min(1, Math.abs(tiltDeg) / GIMBAL_ZONE_DEG);
+  return t * t * (3 - 2 * t); // smoothstep: 0 at tilt=0, 1 by tilt=±20°
 }
 
 function toRad(d) { return d * Math.PI / 180; }
@@ -488,6 +507,11 @@ function updateHud() {
   document.getElementById('hud-roll').textContent = state.roll.toFixed(1) + '°';
   document.getElementById('hud-latlong').textContent =
     state.lat !== null ? state.lat.toFixed(3) + ', ' + state.lon.toFixed(3) : '--';
+  const gimbalNote = document.getElementById('hud-gimbal');
+  if (gimbalNote) {
+    const d = gimbalDamping(state.tiltAlt || 0);
+    gimbalNote.textContent = d < 0.9 ? '⚠ near horizon — tilt up more for stable tracking' : '';
+  }
 }
 
 function loop() {
@@ -508,7 +532,11 @@ function handleOrientation(event) {
   }
 
   const rawHeading = ((heading % 360) + 360) % 360;
-  state.heading = smoothAngle(state.heading, rawHeading, SMOOTHING);
+  // Heading stays partly responsive even in the unstable zone (it's
+  // less severely affected than roll), roll gets damped all the way
+  // toward frozen right at tilt=0 where it's most unreliable.
+  const damping = gimbalDamping(state.tiltAlt || 0);
+  state.heading = smoothAngle(state.heading, rawHeading, SMOOTHING, 0.4 + 0.6 * damping);
 
   // beta: front-back tilt, -180 to 180, 0 = flat, 90 = upright pointing at horizon
   // Convert "phone held upright, pointed at sky" tilt into altitude degrees.
@@ -527,7 +555,7 @@ function handleOrientation(event) {
   // that assumes portrait orientation; it isn't a fully general roll
   // solution for every possible way of holding the phone.
   if (event.gamma !== null) {
-    state.roll = smoothLinear(state.roll, event.gamma, SMOOTHING);
+    state.roll = smoothLinear(state.roll, event.gamma, SMOOTHING, damping);
   }
 }
 
