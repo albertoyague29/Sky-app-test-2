@@ -203,6 +203,13 @@ let state = {
 
 // Smoothing factor: lower = smoother but laggier, higher = snappier but jumpier.
 const SMOOTHING = 0.15;
+// Hard cap on how far a value is allowed to move in a single frame,
+// regardless of how large the raw sensor jump was. Compass readings
+// in particular can spike briefly (magnetic interference, indoors,
+// near metal) — without this cap, smoothing still drags the value
+// toward that bad spike and it reads as a sudden snap. This caps the
+// worst case to a steady, fast-but-bounded motion instead.
+const MAX_STEP_PER_FRAME = 6; // degrees
 
 // Smooths an angle that wraps at 0/360 (compass heading) without
 // glitching at the wrap point — e.g. going from 359° to 1° should
@@ -210,12 +217,16 @@ const SMOOTHING = 0.15;
 function smoothAngle(current, target, factor) {
   if (current === null) return target;
   let diff = angDiff(target, current); // shortest signed distance, handles wrap
-  return ((current + diff * factor) % 360 + 360) % 360;
+  let step = diff * factor;
+  step = Math.max(-MAX_STEP_PER_FRAME, Math.min(MAX_STEP_PER_FRAME, step));
+  return ((current + step) % 360 + 360) % 360;
 }
 
 function smoothLinear(current, target, factor) {
   if (current === null) return target;
-  return current + (target - current) * factor;
+  let step = (target - current) * factor;
+  step = Math.max(-MAX_STEP_PER_FRAME, Math.min(MAX_STEP_PER_FRAME, step));
+  return current + step;
 }
 
 function toRad(d) { return d * Math.PI / 180; }
@@ -347,8 +358,16 @@ function projectToScreen(camVec, canvasW, canvasH, fovHDeg, fovVDeg) {
   const screenX = canvasW / 2 + (camVec.right / camVec.forward) * focalX;
   const screenY = canvasH / 2 - (camVec.up / camVec.forward) * focalY;
 
-  const inView = screenX >= 0 && screenX <= canvasW && screenY >= 0 && screenY <= canvasH;
-  return { x: screenX, y: screenY, inView };
+  // Normalized distance from center, 0 = center, 1 = exactly at the
+  // canvas edge. Used to fade points out smoothly near the boundary
+  // instead of a hard cut, which is what made things look like they
+  // were snapping in/out abruptly.
+  const nx = Math.abs(screenX - canvasW / 2) / (canvasW / 2);
+  const ny = Math.abs(screenY - canvasH / 2) / (canvasH / 2);
+  const edgeDist = Math.max(nx, ny);
+
+  const inView = edgeDist <= 1.15; // small margin so fade has room to complete
+  return { x: screenX, y: screenY, inView, edgeDist };
 }
 
 function draw() {
@@ -397,10 +416,13 @@ function draw() {
       const worldVec = altAzToWorldVector(pos.alt, pos.az);
       const camVec = worldToCameraSpace(worldVec, state.heading, state.tiltAlt, state.roll);
       const proj = projectToScreen(camVec, w, h, FOV_H, FOV_V);
+      // fade smoothly from full opacity at center to 0 at the margin
+      const alpha = proj.inView ? Math.max(0, 1 - Math.max(0, (proj.edgeDist - 0.85) / 0.3)) : 0;
       return {
         x: proj.x,
         y: proj.y,
-        inView: proj.inView,
+        inView: proj.inView && alpha > 0.02,
+        alpha,
         name: constellation.stars[i].name,
       };
     });
@@ -413,13 +435,14 @@ function draw() {
     visibleNames.push(constellation.name);
 
     // Draw connecting lines first (so stars sit on top)
-    ctx.strokeStyle = constellation.color + '80'; // ~50% alpha
     ctx.lineWidth = 1.5;
     constellation.links.forEach(([a, b]) => {
       const pa = screenPts[a], pb = screenPts[b];
       // draw the link if at least one endpoint is in view, so lines
       // don't vanish the instant one star drifts just off-screen
       if (pa.inView || pb.inView) {
+        const lineAlpha = Math.max(pa.alpha, pb.alpha) * 0.5;
+        ctx.strokeStyle = constellation.color + Math.round(lineAlpha * 255).toString(16).padStart(2, '0');
         ctx.beginPath();
         ctx.moveTo(pa.x, pa.y);
         ctx.lineTo(pb.x, pb.y);
@@ -427,9 +450,10 @@ function draw() {
       }
     });
 
-    // Draw each star that's actually in view
+    // Draw each star that's actually in view, faded near the edge
     screenPts.forEach(p => {
       if (!p.inView) return;
+      ctx.globalAlpha = p.alpha;
       ctx.beginPath();
       ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
       ctx.fillStyle = constellation.color;
@@ -441,6 +465,7 @@ function draw() {
       ctx.font = '12px -apple-system, sans-serif';
       ctx.fillStyle = 'rgba(255,255,255,0.7)';
       ctx.fillText(p.name, p.x + 10, p.y + 4);
+      ctx.globalAlpha = 1;
     });
   });
 
