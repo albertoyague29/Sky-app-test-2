@@ -121,7 +121,34 @@
 <script>
 /*
   SKY SENSOR TEST — real 3D perspective projection
-  
+  ----------------------------------------------------------------
+  Previous version mapped stars to screen space by just subtracting
+  azimuth/altitude and scaling linearly — a flat approximation that
+  distorted badly near the zenith and ignored phone roll entirely.
+
+  This version projects properly:
+  1. altAzToWorldVector — star alt/az -> 3D unit vector (East-North-Up)
+  2. worldToCameraSpace — rotate that vector by heading (yaw) and tilt
+     (pitch) using real 3D rotation
+  3. projectToScreen — pinhole-camera perspective projection (tan-based
+     focal length), the same math real cameras/game engines use
+
+  ROLL IS INTENTIONALLY DISABLED (always passed as 0). Mobile Safari's
+  DeviceOrientation API only exposes raw Euler angles (alpha/beta/
+  gamma), not a proper quaternion. These angles hit gimbal lock —
+  heading and roll become numerically coupled and unreliable — right
+  around beta≈90°, which is exactly the pose this app is normally used
+  in (phone held upright, pointed outward). Rather than render a view
+  that intermittently flips/rotates from bad roll readings, roll is
+  ignored entirely. Tilting the phone sideways won't rotate the sky
+  view; a proper fix would need a real quaternion sensor, which isn't
+  available through this API.
+
+  Constellation RA/Dec data is unchanged — only the projection path
+  from "computed alt/az" to "screen pixel" was rebuilt.
+
+  Still NO camera feed — blank canvas so the sensor + astronomy math
+  can be verified on its own before adding AR video.
 */
 
 const canvas = document.getElementById('sky');
@@ -529,7 +556,13 @@ function handleOrientation(event) {
     // when beta ~90 (phone vertical, screen facing you), treat as pointing at horizon (alt 0)
     // tilting top of phone further back/up increases altitude
     const rawTiltAlt = event.beta - 90;
-    state.tiltAlt = smoothLinear(state.tiltAlt, rawTiltAlt, SMOOTHING);
+    const smoothedTilt = smoothLinear(state.tiltAlt, rawTiltAlt, SMOOTHING);
+    // Clamp away from ±90° (straight up/down) — that's the "pole" of
+    // this projection math, the same way a map's North Pole is a
+    // singular point where heading stops being meaningful. Getting
+    // close to it is what causes the view to flip. Staying a few
+    // degrees short avoids ever actually hitting that broken spot.
+    state.tiltAlt = Math.max(-85, Math.min(85, smoothedTilt));
   }
 
   // gamma: left-right tilt, -90 to 90. When the phone is held roughly
