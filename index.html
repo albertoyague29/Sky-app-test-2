@@ -120,7 +120,35 @@
 
 <script>
 /*
- 
+  SKY SENSOR TEST — real 3D perspective projection
+  ----------------------------------------------------------------
+  Previous version mapped stars to screen space by just subtracting
+  azimuth/altitude and scaling linearly — a flat approximation that
+  distorted badly near the zenith and ignored phone roll entirely.
+
+  This version projects properly:
+  1. altAzToWorldVector — star alt/az -> 3D unit vector (East-North-Up)
+  2. worldToCameraSpace — rotate that vector by heading (yaw) and tilt
+     (pitch) using real 3D rotation
+  3. projectToScreen — pinhole-camera perspective projection (tan-based
+     focal length), the same math real cameras/game engines use
+
+  ROLL IS INTENTIONALLY DISABLED (always passed as 0). Mobile Safari's
+  DeviceOrientation API only exposes raw Euler angles (alpha/beta/
+  gamma), not a proper quaternion. These angles hit gimbal lock —
+  heading and roll become numerically coupled and unreliable — right
+  around beta≈90°, which is exactly the pose this app is normally used
+  in (phone held upright, pointed outward). Rather than render a view
+  that intermittently flips/rotates from bad roll readings, roll is
+  ignored entirely. Tilting the phone sideways won't rotate the sky
+  view; a proper fix would need a real quaternion sensor, which isn't
+  available through this API.
+
+  Constellation RA/Dec data is unchanged — only the projection path
+  from "computed alt/az" to "screen pixel" was rebuilt.
+
+  Still NO camera feed — blank canvas so the sensor + astronomy math
+  can be verified on its own before adding AR video.
 */
 
 const canvas = document.getElementById('sky');
@@ -140,7 +168,9 @@ resize();
 // the real camera feed; for now it just sets how "zoomed in" the
 // blank-canvas test feels.
 const FOV_H = 65;
-const FOV_V = 65 * (window.innerHeight / window.innerWidth);
+// Only ONE field of view value needed now — vertical FOV emerges
+// naturally from the shared focal length + canvas aspect ratio,
+// rather than being a separate (and previously buggy) calculation.
 
 // --- Constellations ---
 // RA/Dec in degrees (J2000 epoch — fixed, doesn't change with time).
@@ -348,26 +378,31 @@ function worldToCameraSpace(v, headingDeg, tiltDeg, rollDeg) {
 // degree-to-pixel scale) is what correctly reproduces real camera/eye
 // perspective — objects near the edge of the FOV appear to move
 // faster on screen than objects near the center, just like reality.
-function projectToScreen(camVec, canvasW, canvasH, fovHDeg, fovVDeg) {
+function projectToScreen(camVec, canvasW, canvasH, fovHDeg) {
   if (camVec.forward <= 0) {
     // Point is behind the camera — nothing to draw.
     return { inView: false };
   }
-  const focalX = (canvasW / 2) / Math.tan(toRad(fovHDeg) / 2);
-  const focalY = (canvasH / 2) / Math.tan(toRad(fovVDeg) / 2);
+  // A real camera lens has ONE focal length, used for both axes —
+  // the vertical field of view isn't a separate setting, it just
+  // falls out naturally from combining that focal length with the
+  // screen's aspect ratio. The previous version computed a separate
+  // "vertical FOV" by multiplying the horizontal FOV by the aspect
+  // ratio, which for a tall phone screen produced a wildly inflated
+  // ~140° vertical FOV — meaning the top/bottom edges of the screen
+  // were mathematically reaching past the 90° pole even when you
+  // were pointed nowhere near it. Using one shared focal length
+  // fixes that at the source.
+  const focal = (canvasW / 2) / Math.tan(toRad(fovHDeg) / 2);
 
-  const screenX = canvasW / 2 + (camVec.right / camVec.forward) * focalX;
-  const screenY = canvasH / 2 - (camVec.up / camVec.forward) * focalY;
+  const screenX = canvasW / 2 + (camVec.right / camVec.forward) * focal;
+  const screenY = canvasH / 2 - (camVec.up / camVec.forward) * focal;
 
-  // Normalized distance from center, 0 = center, 1 = exactly at the
-  // canvas edge. Used to fade points out smoothly near the boundary
-  // instead of a hard cut, which is what made things look like they
-  // were snapping in/out abruptly.
   const nx = Math.abs(screenX - canvasW / 2) / (canvasW / 2);
   const ny = Math.abs(screenY - canvasH / 2) / (canvasH / 2);
   const edgeDist = Math.max(nx, ny);
 
-  const inView = edgeDist <= 1.15; // small margin so fade has room to complete
+  const inView = edgeDist <= 1.15;
   return { x: screenX, y: screenY, inView, edgeDist };
 }
 
@@ -416,7 +451,7 @@ function draw() {
     const screenPts = computed.map((pos, i) => {
       const worldVec = altAzToWorldVector(pos.alt, pos.az);
       const camVec = worldToCameraSpace(worldVec, state.heading, state.tiltAlt, 0 /* roll disabled — see note below */);
-      const proj = projectToScreen(camVec, w, h, FOV_H, FOV_V);
+      const proj = projectToScreen(camVec, w, h, FOV_H);
       // fade smoothly from full opacity at center to 0 at the margin
       const alpha = proj.inView ? Math.max(0, 1 - Math.max(0, (proj.edgeDist - 0.85) / 0.3)) : 0;
       return {
